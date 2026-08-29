@@ -321,7 +321,11 @@ def target_rows(path: Path, sheet_name: str) -> tuple[list[dict], int | None, li
             continue
         raw_day = row[0]
         day = excel_day(str(raw_day), date1904) if re.fullmatch(r"-?\d+(?:\.\d+)?", norm(raw_day)) else parse_day(raw_day, f"目标表第 {row_num} 行日期")
-        records.append({"row": row_num, "day": day, "values": row[:8]})
+        values = [
+            day, str(row[1] or ""), str(row[2] or ""), norm(row[3]),
+            parse_amount(row[4], row_num), str(row[5] or ""), str(row[6] or ""), str(row[7] or ""),
+        ]
+        records.append({"row": row_num, "day": day, "values": values})
     return records, reserved_start, headers
 
 
@@ -337,6 +341,57 @@ def inspect_target(path: Path, sheet_name: str) -> dict:
         "firstDate": min((r["day"] for r in records), default=None).isoformat() if records else None,
         "lastDate": max((r["day"] for r in records), default=None).isoformat() if records else None,
     }
+
+
+def analyze_import(existing: list[dict], rows: list[list]) -> dict:
+    incoming_first = min(row[0] for row in rows)
+    incoming_last = max(row[0] for row in rows)
+    existing_first = min((item["day"] for item in existing), default=None)
+    existing_last = max((item["day"] for item in existing), default=None)
+    incoming_days = {row[0] for row in rows}
+    overlaps = [item for item in existing if item["day"] in incoming_days]
+    gap_days = 0
+    historical = False
+    if existing_last is not None:
+        if incoming_first > existing_last:
+            gap_days = max(0, (incoming_first - existing_last).days - 1)
+        else:
+            historical = True
+    return {
+        "existingFirstDate": existing_first,
+        "existingLastDate": existing_last,
+        "incomingFirstDate": incoming_first,
+        "incomingLastDate": incoming_last,
+        "gapDays": gap_days,
+        "historicalBackfill": historical,
+        "overlaps": overlaps,
+    }
+
+
+def read_cleaned(path: Path) -> list[list]:
+    matrix, date1904 = xlsx_matrix(path)
+    if not matrix:
+        fail("清理版表格为空")
+    headers = [norm(value) for value in matrix[0][:8]]
+    if headers != CLEAN_HEADERS:
+        fail(f"清理版表头错误：{headers}")
+    rows = []
+    for row_number, row in enumerate(matrix[1:], start=2):
+        row += [""] * (8 - len(row))
+        if not any(norm(value) for value in row[:8]):
+            continue
+        raw_day = row[0]
+        day = excel_day(str(raw_day), date1904) if re.fullmatch(r"-?\d+(?:\.\d+)?", norm(raw_day)) else parse_day(raw_day, f"清理版第 {row_number} 行日期")
+        row_type = norm(row[3])
+        if row_type not in ALLOWED_TYPES:
+            fail(f"清理版第 {row_number} 行类型无效：{row_type}")
+        rows.append([
+            day, str(row[1] or ""), str(row[2] or ""), row_type,
+            parse_amount(row[4], row_number), str(row[5] or ""), str(row[6] or ""), str(row[7] or ""),
+        ])
+    if not rows:
+        fail("清理版没有可导入记录")
+    return rows
 
 
 def set_inline(cell: ET.Element, value) -> None:
@@ -358,23 +413,56 @@ def set_inline(cell: ET.Element, value) -> None:
         text.text = value
 
 
-def write_target_copy(target: Path, output: Path, rows: list[list], sheet_name: str, overlap_policy: str) -> dict:
+def write_target_copy(
+    target: Path,
+    output: Path,
+    rows: list[list],
+    sheet_name: str,
+    overlap_policy: str,
+    gap_policy: str,
+    historical_policy: str,
+) -> dict:
     if output.exists():
         fail(f"目标输出已存在，拒绝覆盖：{output}")
     if target.resolve() == output.resolve():
         fail("默认禁止原地覆盖财务统计表；请提供新的 --target-output 路径")
     existing, reserved_start, _ = target_rows(target, sheet_name)
-    incoming_days = {row[0] for row in rows}
-    overlaps = [r for r in existing if r["day"] in incoming_days]
+    analysis = analyze_import(existing, rows)
+    overlaps = analysis["overlaps"]
     if overlaps and overlap_policy == "stop":
-        days = sorted({r["day"] for r in overlaps})
+        days = sorted({item["day"] for item in overlaps})
         fail(f"目标表已有 {len(overlaps)} 行落在导入日期中（{days[0]} 至 {days[-1]}）；请明确使用 --overlap-policy replace 或 append")
-    remove_rows = {r["row"] for r in overlaps} if overlap_policy == "replace" else set()
-    kept = [r for r in existing if r["row"] not in remove_rows]
-    next_row = max((r["row"] for r in kept), default=1) + 1
+    if analysis["gapDays"] and gap_policy == "stop":
+        fail(
+            f"目标表最新日期为 {analysis['existingLastDate']}，本次数据从 {analysis['incomingFirstDate']} 开始，"
+            f"中间相隔 {analysis['gapDays']} 天；日期空档不等于缺少账单，请确认后使用 --gap-policy continue"
+        )
+    if analysis["historicalBackfill"] and historical_policy == "stop":
+        fail(
+            f"本次数据日期为 {analysis['incomingFirstDate']} 至 {analysis['incomingLastDate']}，"
+            f"目标表最新日期为 {analysis['existingLastDate']}；这是历史补录，请确认后使用 --historical-policy sort"
+        )
+
+    remove_rows = {item["row"] for item in overlaps} if overlap_policy == "replace" else set()
+    kept = [item for item in existing if item["row"] not in remove_rows]
+    historical_sort = bool(analysis["historicalBackfill"] and historical_policy == "sort")
+    if historical_sort:
+        combined = [(item["day"], 0, item["row"], item["values"]) for item in kept]
+        combined.extend((values[0], 1, index, values) for index, values in enumerate(rows))
+        combined.sort(key=lambda item: (item[0], item[1], item[2]))
+        values_to_write = [item[3] for item in combined]
+        first_written_row = 2
+        rows_to_clear = {item["row"] for item in existing}
+    else:
+        values_to_write = rows
+        first_written_row = max((item["row"] for item in kept), default=1) + 1
+        rows_to_clear = remove_rows
+
     capacity_end = reserved_start - 1 if reserved_start else 1048576
-    if next_row + len(rows) - 1 > capacity_end:
-        fail(f"目标表可写空间不足：需要 {len(rows)} 行，仅剩 {max(0, capacity_end-next_row+1)} 行")
+    final_count = len(kept) + len(rows)
+    required_last_row = (1 + final_count) if historical_sort else (first_written_row + len(rows) - 1)
+    if required_last_row > capacity_end:
+        fail(f"目标表可写空间不足：导入后需要写至第 {required_last_row} 行，可写区截止第 {capacity_end} 行")
 
     with ZipFile(target) as source:
         sheet_path, _ = sheet_path_by_name(source, sheet_name)
@@ -382,37 +470,44 @@ def write_target_copy(target: Path, output: Path, rows: list[list], sheet_name: 
         data = root.find("m:sheetData", NS)
         if data is None:
             fail("目标工作表缺少 sheetData")
-        row_map = {int(r.attrib["r"]): r for r in data.findall("m:row", NS)}
+        row_map = {int(row.attrib["r"]): row for row in data.findall("m:row", NS)}
         template_row = row_map.get(2)
         if template_row is None:
             fail("目标工作表缺少第 2 行格式模板")
-        template_styles = {}
-        for cell in template_row.findall("m:c", NS):
-            template_styles[col_number(cell.attrib["r"])] = cell.attrib.get("s")
-        for row_num in remove_rows:
-            row = row_map.get(row_num)
-            if row is not None:
-                for cell in row.findall("m:c", NS):
-                    if col_number(cell.attrib["r"]) <= 8:
-                        for child in list(cell):
-                            cell.remove(child)
-                        cell.attrib.pop("t", None)
-        for offset, values in enumerate(rows):
-            row_num = next_row + offset
-            row = row_map.get(row_num)
-            if row is None:
-                row = ET.Element(f"{{{MAIN}}}row", {"r": str(row_num), "ht": template_row.attrib.get("ht", "30"), "customHeight": "1"})
-                data.append(row)
-                row_map[row_num] = row
-            cells = {col_number(c.attrib["r"]): c for c in row.findall("m:c", NS)}
+        template_styles = {
+            col_number(cell.attrib["r"]): cell.attrib.get("s")
+            for cell in template_row.findall("m:c", NS)
+        }
+
+        for row_num in rows_to_clear:
+            target_row = row_map.get(row_num)
+            if target_row is None:
+                continue
+            for cell in target_row.findall("m:c", NS):
+                if col_number(cell.attrib["r"]) <= 8:
+                    for child in list(cell):
+                        cell.remove(child)
+                    cell.attrib.pop("t", None)
+
+        for offset, values in enumerate(values_to_write):
+            row_num = first_written_row + offset
+            target_row = row_map.get(row_num)
+            if target_row is None:
+                target_row = ET.Element(
+                    f"{{{MAIN}}}row",
+                    {"r": str(row_num), "ht": template_row.attrib.get("ht", "30"), "customHeight": "1"},
+                )
+                data.append(target_row)
+                row_map[row_num] = target_row
+            cells = {col_number(cell.attrib["r"]): cell for cell in target_row.findall("m:c", NS)}
             for col, value in enumerate(values, start=1):
                 cell = cells.get(col)
                 if cell is None:
-                    cell = ET.SubElement(row, f"{{{MAIN}}}c", {"r": f"{chr(64+col)}{row_num}"})
+                    cell = ET.SubElement(target_row, f"{{{MAIN}}}c", {"r": f"{chr(64 + col)}{row_num}"})
                 if template_styles.get(col) is not None:
                     cell.attrib["s"] = template_styles[col]
                 set_inline(cell, value)
-        data[:] = sorted(data, key=lambda r: int(r.attrib["r"]))
+        data[:] = sorted(data, key=lambda row: int(row.attrib["r"]))
         sheet_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
         workbook = ET.fromstring(source.read("xl/workbook.xml"))
@@ -429,22 +524,29 @@ def write_target_copy(target: Path, output: Path, rows: list[list], sheet_name: 
                 cache.attrib["refreshOnLoad"] = "1"
                 replacements[name] = ET.tostring(cache, encoding="utf-8", xml_declaration=True)
         output.parent.mkdir(parents=True, exist_ok=True)
-        with ZipFile(output, "w") as dest:
+        with ZipFile(output, "w") as destination:
             for item in source.infolist():
-                dest.writestr(item, replacements.get(item.filename, source.read(item.filename)))
+                destination.writestr(item, replacements.get(item.filename, source.read(item.filename)))
 
     verification = inspect_target(output, sheet_name)
-    expected_count = len(existing) - len(remove_rows) + len(rows)
-    if verification["existingRows"] != expected_count:
+    if verification["existingRows"] != final_count:
         output.unlink(missing_ok=True)
-        fail(f"导入后回读行数不符：预期 {expected_count}，实际 {verification['existingRows']}")
+        fail(f"导入后回读行数不符：预期 {final_count}，实际 {verification['existingRows']}")
+    if historical_sort:
+        verified_rows, _, _ = target_rows(output, sheet_name)
+        verified_days = [item["day"] for item in verified_rows]
+        if verified_days != sorted(verified_days):
+            output.unlink(missing_ok=True)
+            fail("历史补录后日期升序回读校验失败")
     return {
         "targetInputPath": str(target.resolve()), "targetOutputPath": str(output.resolve()),
         "sheetName": sheet_name, "overlapPolicy": overlap_policy,
+        "gapPolicy": gap_policy, "historicalPolicy": historical_policy,
+        "gapDays": analysis["gapDays"], "historicalBackfill": analysis["historicalBackfill"],
         "replacedRows": len(remove_rows), "importedRows": len(rows),
-        "firstWrittenRow": next_row, "lastWrittenRow": next_row + len(rows) - 1,
-        "existingRowsAfterImport": verification["existingRows"], "pivotRefreshOnLoad": True,
-        "sourceWorkbookPreserved": True,
+        "firstWrittenRow": first_written_row, "lastWrittenRow": first_written_row + len(values_to_write) - 1,
+        "existingRowsAfterImport": verification["existingRows"], "chronologicallySorted": historical_sort,
+        "pivotRefreshOnLoad": True, "sheetProtectionPreserved": True, "sourceWorkbookPreserved": True,
     }
 
 
@@ -488,6 +590,16 @@ def parser() -> argparse.ArgumentParser:
     combined.add_argument("--end-date", required=True)
     combined.add_argument("--sheet", default="5.每日收入支出明细表")
     combined.add_argument("--overlap-policy", choices=["stop", "replace", "append"], default="stop")
+    combined.add_argument("--gap-policy", choices=["stop", "continue"], default="stop")
+    combined.add_argument("--historical-policy", choices=["stop", "sort"], default="stop")
+    import_cleaned = sub.add_parser("import")
+    import_cleaned.add_argument("--cleaned-input", required=True, type=Path)
+    import_cleaned.add_argument("--target", required=True, type=Path)
+    import_cleaned.add_argument("--target-output", required=True, type=Path)
+    import_cleaned.add_argument("--sheet", default="5.每日收入支出明细表")
+    import_cleaned.add_argument("--overlap-policy", choices=["stop", "replace", "append"], default="stop")
+    import_cleaned.add_argument("--gap-policy", choices=["stop", "continue"], default="stop")
+    import_cleaned.add_argument("--historical-policy", choices=["stop", "sort"], default="stop")
     return result
 
 
@@ -497,6 +609,17 @@ def main() -> None:
         result = inspect_source(args.input)
     elif args.mode == "inspect-target":
         result = inspect_target(args.target, args.sheet)
+    elif args.mode == "import":
+        rows = read_cleaned(args.cleaned_input)
+        imported = write_target_copy(
+            args.target, args.target_output, rows, args.sheet,
+            args.overlap_policy, args.gap_policy, args.historical_policy,
+        )
+        result = {
+            "cleanedInputPath": str(args.cleaned_input.resolve()),
+            "cleanedRows": len(rows),
+            "import": imported,
+        }
     else:
         start, end = parse_day(args.start_date, "--start-date"), parse_day(args.end_date, "--end-date")
         rows, stats = clean_records(args.input, start, end)
@@ -510,7 +633,10 @@ def main() -> None:
             write_clean_xlsx(args.clean_output, rows)
             clean_verification = verify_clean(args.clean_output)
             try:
-                imported = write_target_copy(args.target, args.target_output, rows, args.sheet, args.overlap_policy)
+                imported = write_target_copy(
+                    args.target, args.target_output, rows, args.sheet,
+                    args.overlap_policy, args.gap_policy, args.historical_policy,
+                )
             except Exception:
                 args.clean_output.unlink(missing_ok=True)
                 raise

@@ -85,10 +85,22 @@ description: 清理钱迹导出的 CSV 或 XLSX 账单，并可将清理结果�
    - 标签 1 → 支出类型
    - 标签 2 → 支出必要性
 4. 自动识别目标页顶部连续数据区与后部保留数据区，只向两者之间的空白区写入；容量不足时停止。
-5. 默认追加。如果目标表已有记录与本次导入日期重叠，默认停止并报告重叠行数和日期范围，只询问一个会改变动作的问题：
-   - `replace`：清空目标表中与本批记录日期相同的旧行，再追加本批记录；
-   - `append`：保留旧行并继续追加，可能形成重复记录。
-6. 未获得用户明确选择时不得替用户决定 `replace` 或 `append`。日期重叠检查不能当作逐笔去重；相同日期、金额和备注仍可能是两笔真实交易。
+5. 比较目标表现有记录和本批记录的日期衔接情况：
+   - 目标表为空，或本批最早日期正好是目标表最新日期的次日：正常继续；
+   - 本批最早日期晚于目标表最新日期的次日：默认停止，报告两端日期及中间相隔天数。说明日期空档不等于一定缺失账单，并询问用户是继续导入还是先补充数据；只有确认继续后才使用 `--gap-policy continue`；
+   - 本批最早日期早于或等于目标表最新日期：进入历史补录或日期重叠检查。
+6. 如果目标表已有记录与本次导入日期重叠，默认停止并报告重叠行数和日期范围，只询问一个会改变动作的问题：
+   - `replace`：清空目标表中与本批记录日期相同的旧行，再导入本批记录；
+   - `append`：保留旧行并导入本批记录，可能形成重复记录。
+7. 未获得用户明确选择时不得替用户决定 `replace` 或 `append`。日期重叠检查不能当作逐笔去重；相同日期、金额和备注仍可能是两笔真实交易。
+8. 本批数据早于目标表最新日期时视为历史补录，默认停止并报告本批日期范围与目标表最新日期。用户确认后使用 `--historical-policy sort`：
+   - 合并保留的旧记录与本批记录；
+   - 在内存中按日期升序排列；
+   - 同一天先保持原有记录顺序，再保持本批记录的输入顺序；
+   - 不调用 Excel 界面的排序或插入整行，而是只重写数据区 A:H 的值，因此工作表锁定不阻止处理；
+   - 保留 `sheetProtection`、后部保留数据、其他工作表和工作簿对象；
+   - 导入后回读确认日期为非降序。
+9. 历史补录同时存在重叠时，必须先取得 `replace` 或 `append` 决定，再取得历史重排授权；不能用一次授权替代另一项决定。
 
 ## 文件安全
 
@@ -137,10 +149,25 @@ python3 scripts/qianji_bill.py clean-import \
   --start-date <YYYY-MM-DD> \
   --end-date <YYYY-MM-DD> \
   --sheet '5.每日收入支出明细表' \
-  --overlap-policy stop
+  --overlap-policy stop \
+  --gap-policy stop \
+  --historical-policy stop
 ```
 
-只有用户明确处理重叠方式后，才将最后一个参数改为 `replace` 或 `append`。
+用户先完成清理、之后才提供统计表时，直接导入已有清理版，不重复清理：
+
+```bash
+python3 scripts/qianji_bill.py import \
+  --cleaned-input '<清理版路径>' \
+  --target '<原统计表路径>' \
+  --target-output '<带时间戳的统计表副本路径>' \
+  --sheet '5.每日收入支出明细表' \
+  --overlap-policy stop \
+  --gap-policy stop \
+  --historical-policy stop
+```
+
+只有取得对应授权后才改变参数：日期重叠使用 `--overlap-policy replace|append`，日期空档使用 `--gap-policy continue`，历史补录重排使用 `--historical-policy sort`。
 
 ## 交付核对
 
@@ -149,6 +176,8 @@ python3 scripts/qianji_bill.py clean-import \
 - `sourceRows = removedMarkedRows + removedOtherTypeRows + removedOutsideDateRows + outputRows`；
 - 清理版表头与固定 8 列一致，类型只含收入／支出，日期非降序，日期与金额均为数值；
 - 导入行数与清理版行数一致；
+- 日期空档已报告 `gapDays`，只有用户确认后才继续；
+- 历史补录的 `chronologicallySorted` 为 `true`，回读日期为非降序，且工作表保护仍存在；
 - `firstWrittenRow` 至 `lastWrittenRow` 位于目标可写区；
 - 统计表副本可以作为 ZIP／XLSX 完整回读，目标页导入后行数符合预期；
 - 原始账单和原统计表的修改时间、大小与内容未被改动；
