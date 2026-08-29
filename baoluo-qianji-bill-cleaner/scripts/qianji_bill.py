@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import shutil
@@ -394,9 +395,15 @@ def read_cleaned(path: Path) -> list[list]:
     return rows
 
 
-def set_inline(cell: ET.Element, value) -> None:
+def clear_cell_value(cell: ET.Element) -> None:
     for child in list(cell):
-        cell.remove(child)
+        if child.tag in {f"{{{MAIN}}}f", f"{{{MAIN}}}v", f"{{{MAIN}}}is"}:
+            cell.remove(child)
+    cell.attrib.pop("t", None)
+
+
+def set_inline(cell: ET.Element, value) -> None:
+    clear_cell_value(cell)
     if isinstance(value, date):
         cell.attrib.pop("t", None)
         ET.SubElement(cell, f"{{{MAIN}}}v").text = str(excel_serial(value))
@@ -413,6 +420,33 @@ def set_inline(cell: ET.Element, value) -> None:
         text.text = value
 
 
+def formatting_snapshot(path: Path, sheet_name: str) -> dict:
+    with ZipFile(path) as book:
+        sheet_path, _ = sheet_path_by_name(book, sheet_name)
+        root = ET.fromstring(book.read(sheet_path))
+        style_hash = hashlib.sha256(book.read("xl/styles.xml")).hexdigest()
+        row_formatting = []
+        cell_styles = []
+        for row in root.findall("m:sheetData/m:row", NS):
+            row_formatting.append((row.attrib.get("r"), tuple(sorted(row.attrib.items()))))
+            for cell in row.findall("m:c", NS):
+                cell_styles.append((cell.attrib.get("r"), cell.attrib.get("s")))
+        protected_parts = {}
+        for tag in [
+            "sheetFormatPr", "cols", "mergeCells", "conditionalFormatting",
+            "dataValidations", "sheetProtection", "drawing", "legacyDrawing",
+        ]:
+            protected_parts[tag] = [
+                ET.tostring(item, encoding="unicode") for item in root.findall(f"m:{tag}", NS)
+            ]
+        return {
+            "stylesXmlSha256": style_hash,
+            "rowFormatting": row_formatting,
+            "cellStyles": cell_styles,
+            "protectedParts": protected_parts,
+        }
+
+
 def write_target_copy(
     target: Path,
     output: Path,
@@ -426,6 +460,7 @@ def write_target_copy(
         fail(f"目标输出已存在，拒绝覆盖：{output}")
     if target.resolve() == output.resolve():
         fail("默认禁止原地覆盖财务统计表；请提供新的 --target-output 路径")
+    formatting_before = formatting_snapshot(target, sheet_name)
     existing, reserved_start, _ = target_rows(target, sheet_name)
     analysis = analyze_import(existing, rows)
     overlaps = analysis["overlaps"]
@@ -471,41 +506,24 @@ def write_target_copy(
         if data is None:
             fail("目标工作表缺少 sheetData")
         row_map = {int(row.attrib["r"]): row for row in data.findall("m:row", NS)}
-        template_row = row_map.get(2)
-        if template_row is None:
-            fail("目标工作表缺少第 2 行格式模板")
-        template_styles = {
-            col_number(cell.attrib["r"]): cell.attrib.get("s")
-            for cell in template_row.findall("m:c", NS)
-        }
-
         for row_num in rows_to_clear:
             target_row = row_map.get(row_num)
             if target_row is None:
                 continue
             for cell in target_row.findall("m:c", NS):
                 if col_number(cell.attrib["r"]) <= 8:
-                    for child in list(cell):
-                        cell.remove(child)
-                    cell.attrib.pop("t", None)
+                    clear_cell_value(cell)
 
         for offset, values in enumerate(values_to_write):
             row_num = first_written_row + offset
             target_row = row_map.get(row_num)
             if target_row is None:
-                target_row = ET.Element(
-                    f"{{{MAIN}}}row",
-                    {"r": str(row_num), "ht": template_row.attrib.get("ht", "30"), "customHeight": "1"},
-                )
-                data.append(target_row)
-                row_map[row_num] = target_row
+                fail(f"目标表第 {row_num} 行不存在预设格式，无法保证仅粘贴值")
             cells = {col_number(cell.attrib["r"]): cell for cell in target_row.findall("m:c", NS)}
             for col, value in enumerate(values, start=1):
                 cell = cells.get(col)
                 if cell is None:
-                    cell = ET.SubElement(target_row, f"{{{MAIN}}}c", {"r": f"{chr(64 + col)}{row_num}"})
-                if template_styles.get(col) is not None:
-                    cell.attrib["s"] = template_styles[col]
+                    fail(f"目标单元格 {chr(64 + col)}{row_num} 不存在预设格式，无法保证仅粘贴值")
                 set_inline(cell, value)
         data[:] = sorted(data, key=lambda row: int(row.attrib["r"]))
         sheet_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
@@ -528,6 +546,10 @@ def write_target_copy(
             for item in source.infolist():
                 destination.writestr(item, replacements.get(item.filename, source.read(item.filename)))
 
+    formatting_after = formatting_snapshot(output, sheet_name)
+    if formatting_after != formatting_before:
+        output.unlink(missing_ok=True)
+        fail("导入前后格式签名不一致；已删除输出，未交付可能改变格式的文件")
     verification = inspect_target(output, sheet_name)
     if verification["existingRows"] != final_count:
         output.unlink(missing_ok=True)
@@ -546,7 +568,8 @@ def write_target_copy(
         "replacedRows": len(remove_rows), "importedRows": len(rows),
         "firstWrittenRow": first_written_row, "lastWrittenRow": first_written_row + len(values_to_write) - 1,
         "existingRowsAfterImport": verification["existingRows"], "chronologicallySorted": historical_sort,
-        "pivotRefreshOnLoad": True, "sheetProtectionPreserved": True, "sourceWorkbookPreserved": True,
+        "pivotRefreshOnLoad": True, "sheetProtectionPreserved": True,
+        "pasteValuesOnly": True, "formattingSignaturePreserved": True, "sourceWorkbookPreserved": True,
     }
 
 
