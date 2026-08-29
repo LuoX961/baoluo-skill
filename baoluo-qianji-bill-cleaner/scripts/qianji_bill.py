@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
+import os
 import re
 import shutil
 import sys
@@ -34,6 +36,7 @@ TARGET_HEADER_ALIASES = [
     {"金额"}, {"备注"}, {"支出类型", "标签 1", "标签1"}, {"支出必要性", "标签 2", "标签2"},
 ]
 ALLOWED_TYPES = {"收入", "支出"}
+BACKUP_RETENTION_DAYS = 30
 
 
 def fail(message: str) -> None:
@@ -260,6 +263,54 @@ def xml_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
+def parse_xml_for_rewrite(payload: bytes) -> tuple[ET.Element, dict[str, str]]:
+    namespaces: dict[str, str] = {}
+    for _, item in ET.iterparse(io.BytesIO(payload), events=("start-ns",)):
+        prefix, uri = item
+        prefix = prefix or ""
+        namespaces[prefix] = uri
+        if prefix not in {"xml", "xmlns"} and not re.fullmatch(r"ns\d+", prefix):
+            ET.register_namespace(prefix, uri)
+    return ET.fromstring(payload), namespaces
+
+
+def serialize_rewritten_xml(root: ET.Element, namespaces: dict[str, str], part_name: str) -> bytes:
+    payload = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    text = payload.decode("utf-8")
+    root_match = re.search(r"<(?:[A-Za-z_][\w.-]*:)?[A-Za-z_][\w.-]*(?=[\s>])", text)
+    if root_match is None:
+        fail(f"无法定位 XML 根元素：{part_name}")
+    root_end = text.find(">", root_match.start())
+    if root_end < 0:
+        fail(f"XML 根元素未闭合：{part_name}")
+    root_tag = text[root_match.start():root_end + 1]
+    declared = set(re.findall(r"xmlns:([A-Za-z_][\w.-]*)=", root_tag))
+    additions = []
+    for prefix, uri in namespaces.items():
+        if prefix and prefix not in {"xml", "xmlns"} and prefix not in declared:
+            additions.append(f' xmlns:{prefix}="{xml_escape(uri)}"')
+    if additions:
+        insert_at = root_end - 1 if text[root_end - 1] == "/" else root_end
+        text = text[:insert_at] + "".join(additions) + text[insert_at:]
+        root_end += sum(len(item) for item in additions)
+        root_tag = text[root_match.start():root_end + 1]
+        declared = set(re.findall(r"xmlns:([A-Za-z_][\w.-]*)=", root_tag))
+    ignorable = re.findall(r"(?:[A-Za-z_][\w.-]*:)?Ignorable=\"([^\"]+)\"", root_tag)
+    missing = sorted(set(" ".join(ignorable).split()) - declared)
+    if missing:
+        fail(f"{part_name} 的 mc:Ignorable 存在未声明前缀：{', '.join(missing)}")
+    return text.encode("utf-8")
+
+
+def element_signature(element: ET.Element):
+    return (
+        element.tag,
+        tuple(sorted(element.attrib.items())),
+        element.text or "",
+        tuple(element_signature(child) for child in list(element)),
+    )
+
+
 def cell_xml(ref: str, value, style: int) -> str:
     if isinstance(value, date):
         return f'<c r="{ref}" s="{style}"><v>{excel_serial(value)}</v></c>'
@@ -437,7 +488,7 @@ def formatting_snapshot(path: Path, sheet_name: str) -> dict:
             "dataValidations", "sheetProtection", "drawing", "legacyDrawing",
         ]:
             protected_parts[tag] = [
-                ET.tostring(item, encoding="unicode") for item in root.findall(f"m:{tag}", NS)
+                element_signature(item) for item in root.findall(f"m:{tag}", NS)
             ]
         return {
             "stylesXmlSha256": style_hash,
@@ -447,7 +498,7 @@ def formatting_snapshot(path: Path, sheet_name: str) -> dict:
         }
 
 
-def write_target_copy(
+def build_validated_target(
     target: Path,
     output: Path,
     rows: list[list],
@@ -459,7 +510,7 @@ def write_target_copy(
     if output.exists():
         fail(f"目标输出已存在，拒绝覆盖：{output}")
     if target.resolve() == output.resolve():
-        fail("默认禁止原地覆盖财务统计表；请提供新的 --target-output 路径")
+        fail("校验阶段的临时输出路径不得与原统计表相同")
     formatting_before = formatting_snapshot(target, sheet_name)
     existing, reserved_start, _ = target_rows(target, sheet_name)
     analysis = analyze_import(existing, rows)
@@ -501,7 +552,7 @@ def write_target_copy(
 
     with ZipFile(target) as source:
         sheet_path, _ = sheet_path_by_name(source, sheet_name)
-        root = ET.fromstring(source.read(sheet_path))
+        root, sheet_namespaces = parse_xml_for_rewrite(source.read(sheet_path))
         data = root.find("m:sheetData", NS)
         if data is None:
             fail("目标工作表缺少 sheetData")
@@ -526,21 +577,21 @@ def write_target_copy(
                     fail(f"目标单元格 {chr(64 + col)}{row_num} 不存在预设格式，无法保证仅粘贴值")
                 set_inline(cell, value)
         data[:] = sorted(data, key=lambda row: int(row.attrib["r"]))
-        sheet_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        sheet_bytes = serialize_rewritten_xml(root, sheet_namespaces, sheet_path)
 
-        workbook = ET.fromstring(source.read("xl/workbook.xml"))
+        workbook, workbook_namespaces = parse_xml_for_rewrite(source.read("xl/workbook.xml"))
         calc = workbook.find("m:calcPr", NS)
         if calc is None:
             calc = ET.SubElement(workbook, f"{{{MAIN}}}calcPr")
         calc.attrib.update({"calcMode": "auto", "fullCalcOnLoad": "1", "forceFullCalc": "1"})
-        workbook_bytes = ET.tostring(workbook, encoding="utf-8", xml_declaration=True)
+        workbook_bytes = serialize_rewritten_xml(workbook, workbook_namespaces, "xl/workbook.xml")
 
         replacements = {sheet_path: sheet_bytes, "xl/workbook.xml": workbook_bytes}
         for name in source.namelist():
             if name.startswith("xl/pivotCache/pivotCacheDefinition") and name.endswith(".xml"):
-                cache = ET.fromstring(source.read(name))
+                cache, cache_namespaces = parse_xml_for_rewrite(source.read(name))
                 cache.attrib["refreshOnLoad"] = "1"
-                replacements[name] = ET.tostring(cache, encoding="utf-8", xml_declaration=True)
+                replacements[name] = serialize_rewritten_xml(cache, cache_namespaces, name)
         output.parent.mkdir(parents=True, exist_ok=True)
         with ZipFile(output, "w") as destination:
             for item in source.infolist():
@@ -571,6 +622,172 @@ def write_target_copy(
         "pivotRefreshOnLoad": True, "sheetProtectionPreserved": True,
         "pasteValuesOnly": True, "formattingSignaturePreserved": True, "sourceWorkbookPreserved": True,
     }
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def default_backup_path(target: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = target.with_name(f"{target.stem}_写入前备份_{stamp}{target.suffix}")
+    counter = 2
+    while candidate.exists() or backup_trash_path(candidate, date.today()).exists():
+        candidate = target.with_name(f"{target.stem}_写入前备份_{stamp}_{counter}{target.suffix}")
+        counter += 1
+    return candidate
+
+
+def backup_trash_path(backup: Path, archived_on: date) -> Path:
+    trash = backup.parent / ".trash"
+    return trash / f"{archived_on.isoformat()}_{backup.name}"
+
+
+def archive_verified_backup(backup: Path, archived_on: date) -> Path:
+    archived = backup_trash_path(backup, archived_on)
+    archived.parent.mkdir(parents=True, exist_ok=True)
+    if archived.exists():
+        fail(f"安全删除目标已存在，拒绝覆盖：{archived}")
+    os.replace(backup, archived)
+    return archived
+
+
+def cleanup_expired_backups(trash: Path, target: Path, today: date) -> list[str]:
+    if not trash.exists():
+        return []
+    pattern = re.compile(
+        rf"^(\d{{4}}-\d{{2}}-\d{{2}})_{re.escape(target.stem)}_写入前备份_"
+        rf"\d{{8}}_\d{{6}}(?:_\d+)?{re.escape(target.suffix)}$"
+    )
+    removed = []
+    for candidate in trash.iterdir():
+        if not candidate.is_file():
+            continue
+        match = pattern.fullmatch(candidate.name)
+        if not match:
+            continue
+        archived_on = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        if (today - archived_on).days <= BACKUP_RETENTION_DAYS:
+            continue
+        candidate.unlink()
+        removed.append(str(candidate.resolve()))
+    return removed
+
+
+def write_target_in_place(
+    target: Path,
+    rows: list[list],
+    sheet_name: str,
+    overlap_policy: str,
+    gap_policy: str,
+    historical_policy: str,
+    backup_output: Path | None = None,
+) -> dict:
+    if not target.exists():
+        fail(f"统计表不存在：{target}")
+    backup = backup_output or default_backup_path(target)
+    if backup.resolve() == target.resolve():
+        fail("备份路径不得与原统计表相同")
+    if backup.exists():
+        fail(f"备份文件已存在，拒绝覆盖：{backup}")
+    archive_candidate = backup_trash_path(backup, date.today())
+    if archive_candidate.exists():
+        fail(f"安全删除目标已存在，拒绝覆盖：{archive_candidate}")
+
+    # 不使用点号开头的临时文件名。macOS，尤其是 iCloud Drive，可能在文件
+    # 改名到可见目标路径后，再次给由点号文件创建的 inode 加上 UF_HIDDEN。
+    fd, temp_name = tempfile.mkstemp(prefix=f"{target.stem}_导入临时_", suffix=target.suffix, dir=target.parent)
+    os.close(fd)
+    temp_output = Path(temp_name)
+    temp_output.unlink()
+    backup_temp = backup.with_name(f"{backup.name}.tmp")
+    if backup_temp.exists():
+        fail(f"备份临时文件已存在，拒绝覆盖：{backup_temp}")
+
+    original_hash = file_sha256(target)
+    original_flags = getattr(target.stat(), "st_flags", None)
+    archived_backup = None
+    replaced = False
+    try:
+        imported = build_validated_target(
+            target, temp_output, rows, sheet_name,
+            overlap_policy, gap_policy, historical_policy,
+        )
+        updated_hash = file_sha256(temp_output)
+
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, backup_temp)
+        if file_sha256(backup_temp) != original_hash:
+            fail("写入前备份哈希与原统计表不一致")
+        os.replace(backup_temp, backup)
+        if original_flags is not None and hasattr(os, "chflags"):
+            os.chflags(backup, original_flags)
+
+        shutil.copystat(target, temp_output)
+        if original_flags is not None and hasattr(os, "chflags"):
+            os.chflags(temp_output, original_flags)
+        os.replace(temp_output, target)
+        replaced = True
+        if original_flags is not None and hasattr(os, "chflags"):
+            os.chflags(target, original_flags)
+        if file_sha256(target) != updated_hash:
+            fail("原子替换后统计表哈希与已校验临时文件不一致")
+        verification = inspect_target(target, sheet_name)
+        if verification["existingRows"] != imported["existingRowsAfterImport"]:
+            fail("原地写入后回读行数与临时文件校验结果不一致")
+
+        archived_on = date.today()
+        archived_backup = archive_verified_backup(backup, archived_on)
+        if file_sha256(archived_backup) != original_hash:
+            fail("移入 .trash 后的写入前备份哈希与原统计表不一致")
+        expired_backups = cleanup_expired_backups(archived_backup.parent, target, archived_on)
+        final_flags = getattr(target.stat(), "st_flags", None)
+        if original_flags is not None and final_flags != original_flags:
+            fail(
+                f"原地更新后文件系统标志不一致：更新前 {original_flags}，更新后 {final_flags}"
+            )
+
+        imported.update({
+            "targetInputPath": str(target.resolve()),
+            "targetOutputPath": str(target.resolve()),
+            "backupPath": str(archived_backup.resolve()),
+            "backupMovedToTrash": True,
+            "backupRetentionDays": BACKUP_RETENTION_DAYS,
+            "expiredBackupsDeleted": len(expired_backups),
+            "inPlaceUpdated": True,
+            "originalWorkbookBackedUp": True,
+            "atomicReplace": True,
+            "fileSystemFlagsPreserved": final_flags == original_flags,
+            "fileSystemFlagsBefore": original_flags,
+            "fileSystemFlagsAfter": final_flags,
+            "sourceWorkbookPreserved": False,
+        })
+        return imported
+    except Exception:
+        recovery_backup = archived_backup if archived_backup and archived_backup.exists() else backup
+        if replaced and recovery_backup.exists():
+            restore_fd, restore_name = tempfile.mkstemp(
+                prefix=f"{target.stem}_回退临时_", suffix=target.suffix, dir=target.parent
+            )
+            os.close(restore_fd)
+            restore_temp = Path(restore_name)
+            try:
+                shutil.copy2(recovery_backup, restore_temp)
+                if original_flags is not None and hasattr(os, "chflags"):
+                    os.chflags(restore_temp, original_flags)
+                os.replace(restore_temp, target)
+                if original_flags is not None and hasattr(os, "chflags"):
+                    os.chflags(target, original_flags)
+            finally:
+                restore_temp.unlink(missing_ok=True)
+        raise
+    finally:
+        temp_output.unlink(missing_ok=True)
+        backup_temp.unlink(missing_ok=True)
 
 
 def verify_clean(path: Path) -> dict:
@@ -608,7 +825,7 @@ def parser() -> argparse.ArgumentParser:
     combined.add_argument("--input", required=True, type=Path)
     combined.add_argument("--clean-output", required=True, type=Path)
     combined.add_argument("--target", required=True, type=Path)
-    combined.add_argument("--target-output", required=True, type=Path)
+    combined.add_argument("--backup-output", type=Path)
     combined.add_argument("--start-date", required=True)
     combined.add_argument("--end-date", required=True)
     combined.add_argument("--sheet", default="5.每日收入支出明细表")
@@ -618,7 +835,7 @@ def parser() -> argparse.ArgumentParser:
     import_cleaned = sub.add_parser("import")
     import_cleaned.add_argument("--cleaned-input", required=True, type=Path)
     import_cleaned.add_argument("--target", required=True, type=Path)
-    import_cleaned.add_argument("--target-output", required=True, type=Path)
+    import_cleaned.add_argument("--backup-output", type=Path)
     import_cleaned.add_argument("--sheet", default="5.每日收入支出明细表")
     import_cleaned.add_argument("--overlap-policy", choices=["stop", "replace", "append"], default="stop")
     import_cleaned.add_argument("--gap-policy", choices=["stop", "continue"], default="stop")
@@ -634,9 +851,10 @@ def main() -> None:
         result = inspect_target(args.target, args.sheet)
     elif args.mode == "import":
         rows = read_cleaned(args.cleaned_input)
-        imported = write_target_copy(
-            args.target, args.target_output, rows, args.sheet,
+        imported = write_target_in_place(
+            args.target, rows, args.sheet,
             args.overlap_policy, args.gap_policy, args.historical_policy,
+            args.backup_output,
         )
         result = {
             "cleanedInputPath": str(args.cleaned_input.resolve()),
@@ -651,14 +869,15 @@ def main() -> None:
             stats.update({"inputPath": str(args.input.resolve()), "outputPath": str(args.output.resolve()), "verification": verify_clean(args.output)})
             result = stats
         else:
-            if args.clean_output.resolve() == args.target_output.resolve():
-                fail("--clean-output 与 --target-output 不得相同")
+            if args.clean_output.resolve() == args.target.resolve():
+                fail("--clean-output 与 --target 不得相同")
             write_clean_xlsx(args.clean_output, rows)
             clean_verification = verify_clean(args.clean_output)
             try:
-                imported = write_target_copy(
-                    args.target, args.target_output, rows, args.sheet,
+                imported = write_target_in_place(
+                    args.target, rows, args.sheet,
                     args.overlap_policy, args.gap_policy, args.historical_policy,
+                    args.backup_output,
                 )
             except Exception:
                 args.clean_output.unlink(missing_ok=True)

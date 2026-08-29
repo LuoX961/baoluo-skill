@@ -1,1 +1,3 @@
 rule_id,name,scope,status,created,revised,supersedes,card_path,cold_ref
+QBC-001,备份后原地更新统计表,core,active,2026-08-29,2026-08-29,,rules/QBC-001.md,cold/2026-08-29-QBC-001.md
+QBC-002,成功写入后安全归档备份,core,active,2026-08-29,2026-08-29,,rules/QBC-002.md,cold/2026-08-29-QBC-002.md

@@ -1,0 +1,140 @@
+{
+  "skill": "baoluo-qianji-bill-cleaner",
+  "behavior_contract": {
+    "must": [
+      "扫描后等待用户明确日期范围",
+      "按固定字段和过滤规则输出可回读 XLSX",
+      "导入前生成哈希一致的写入前备份，校验通过后原子更新原统计表路径",
+      "日期重叠时默认停止",
+      "已提供统计表但未授权导入时，在确认日期范围时合并询问导入意愿",
+      "未提供统计表时，完成清理后主动询问是否继续导入",
+      "前向日期存在空档时默认停止并报告相隔天数",
+      "历史补录经确认后重写数据区并按日期升序排列",
+      "历史补录后保留工作表保护和后部保留数据",
+      "写入目标表时只替换值并保持导入前后的格式签名完全一致",
+      "导入后回读核对行数并刷新数据透视缓存",
+      "全部检查通过后把写入前备份移入同目录 .trash，并只清理超过 30 天的同类备份",
+      "macOS 与 iCloud Drive 中原子替换后保持原统计表的文件系统标志，不把 UF_HIDDEN 带到可见原文件"
+    ],
+    "must_not": [
+      "覆盖原账单，或未生成完整备份便更新原统计表",
+      "静默丢弃多个 # 后的标签",
+      "在日期重叠时擅自替换或追加",
+      "自行搜索用户电脑中的财务统计表",
+      "用户明确只清理时仍追问导入",
+      "把日期空档直接断言为账单缺失",
+      "未获授权时自动重排历史数据",
+      "为排序而解除工作表保护或插入整行",
+      "覆盖目标单元格原有样式 ID或创建无预设格式的单元格",
+      "破坏目标工作簿的其他工作表和对象",
+      "在更新后检查完成前移动备份，或清理 .trash 中不属于本 Skill 的文件"
+    ]
+  },
+  "cases": [
+    {
+      "id": "normal-csv-import-01",
+      "type": "normal",
+      "prompt": "清理一份同时含收入、支出、转账、标记行和范围外记录的 UTF-8 CSV，并导入空白统计表模板。",
+      "input_files": ["运行时生成的合成 CSV", "用户授权的测试模板副本"],
+      "expected_behavior": ["仅保留日期范围内未标记的收入和支出", "输出清理版并直接更新原统计表路径", "生成与更新前统计表哈希一致的带时间戳备份", "全部检查通过后将备份移入同目录 .trash", "原始钱迹账单哈希不变"]
+    },
+    {
+      "id": "normal-xlsx-02",
+      "type": "normal",
+      "prompt": "读取包含真实 Excel 日期与金额数值的钱迹 XLSX，清理并按日期升序输出。",
+      "input_files": ["运行时生成的合成 XLSX"],
+      "expected_behavior": ["正确识别 Excel 日期序列", "金额保持数值", "输出回读通过"]
+    },
+    {
+      "id": "boundary-overlap-03",
+      "type": "boundary",
+      "prompt": "把与目标表已有日期重叠的一批记录导入统计表，用户没有指定处理策略。",
+      "input_files": ["已有 2 行数据的测试统计表", "含重叠日期的合成账单"],
+      "expected_behavior": ["默认停止", "报告重叠行和日期", "不修改原统计表，不留下清理版或部分写入文件"]
+    },
+    {
+      "id": "boundary-tag-04",
+      "type": "boundary",
+      "prompt": "清理一行标签为 A#B#C 的钱迹账单。",
+      "input_files": ["运行时生成的合成 CSV"],
+      "expected_behavior": ["停止并指出标签含超过 1 个 #", "不生成输出文件"]
+    },
+    {
+      "id": "neighbor-wrong-target-05",
+      "type": "near_neighbor",
+      "prompt": "把清理结果导入一个缺少目标工作表或前 8 列结构不同的普通 Excel。",
+      "input_files": ["结构不匹配的合成 XLSX"],
+      "expected_behavior": ["拒绝导入并指出具体结构缺口", "不把普通 Excel 当成财务统计模板改写"]
+    },
+    {
+      "id": "interaction-target-provided-06",
+      "type": "normal",
+      "prompt": "用户同时提供钱迹账单和统计表路径，但没有明确说是否导入。",
+      "input_files": ["合成钱迹账单", "测试统计表"],
+      "expected_behavior": ["只读检查两个文件", "在第一次确认日期范围时一并询问是否直接导入指定统计表", "未获同意前不备份或更新统计表"]
+    },
+    {
+      "id": "interaction-target-missing-07",
+      "type": "boundary",
+      "prompt": "用户只提供钱迹账单，也没有说明只清理或需要导入。",
+      "input_files": ["合成钱迹账单"],
+      "expected_behavior": ["先确认日期并完成清理", "交付清理版后主动询问是否继续导入", "需要导入时要求用户提供统计表路径", "不自行搜索本机文件"]
+    },
+    {
+      "id": "interaction-clean-only-08",
+      "type": "near_neighbor",
+      "prompt": "用户明确要求只清理账单，不导入任何统计表。",
+      "input_files": ["合成钱迹账单"],
+      "expected_behavior": ["只完成清理版", "不询问统计表路径或导入意愿"]
+    },
+    {
+      "id": "boundary-forward-gap-09",
+      "type": "boundary",
+      "prompt": "目标表最新日期为 2026-05-06，本批数据为 2026-06-01 至 2026-06-30。",
+      "input_files": ["含 2026-05-06 数据的测试统计表", "6 月清理版"],
+      "expected_behavior": ["默认停止", "报告中间相隔 25 天", "说明空档不等于一定缺失", "确认继续后才导入"]
+    },
+    {
+      "id": "historical-backfill-10",
+      "type": "normal",
+      "prompt": "目标表已有 2026-05-06 和 2026-06-01 至 2026-06-30，补录 2026-05-07 至 2026-05-31。",
+      "input_files": ["含 5 月和 6 月数据的测试统计表", "5 月历史清理版"],
+      "expected_behavior": ["默认识别为历史补录并停止", "确认后合并新旧数据并按日期升序重写", "最终日期顺序为 5 月后接 6 月"]
+    },
+    {
+      "id": "historical-protected-sheet-11",
+      "type": "regression",
+      "prompt": "对锁定的每日收入支出明细表执行历史补录重排。",
+      "input_files": ["包含 sheetProtection 的测试统计表", "历史清理版"],
+      "expected_behavior": ["不调用 Excel 排序或插入整行", "仅重写 A:H 数据值", "输出仍包含 sheetProtection", "保留后部数据和其他工作簿对象"]
+    },
+    {
+      "id": "format-paste-values-only-14",
+      "type": "regression",
+      "prompt": "把清理结果导入含预设样式、数据验证和锁定设置的财务统计表。",
+      "input_files": ["带完整预设格式的测试统计表", "清理版"],
+      "expected_behavior": ["只替换目标单元格的值", "导入前后 styles.xml、单元格样式 ID、行列格式、条件格式、数据验证和保护设置一致", "缺少预格式化目标单元格时停止而非新建"]
+    },
+    {
+      "id": "in-place-backup-15",
+      "type": "regression",
+      "prompt": "把清理结果导入现有统计表，正常流程不应让用户改用新的主文件。",
+      "input_files": ["已有连续数据的测试统计表", "清理版"],
+      "expected_behavior": ["先在临时文件完成全部校验", "生成与更新前原表哈希一致的带时间戳备份", "原子更新原统计表路径", "更新后检查通过再把备份移入同目录 .trash", "不生成需要用户改用的统计表主副本", "失败时原表保持原样或自动回退"]
+    },
+    {
+      "id": "backup-trash-retention-16",
+      "type": "regression",
+      "prompt": "连续导入统计表并检查写入前备份的归档和 30 天保留策略。",
+      "input_files": ["已有连续数据的测试统计表", "清理版", ".trash 中 30 天、31 天及无关测试文件"],
+      "expected_behavior": ["当前备份只在全部检查通过后移入 .trash", "文件名使用 YYYY-MM-DD_原备份文件名", "31 天前的同表备份被清理", "恰好 30 天的备份和无关文件保留", "工作目录不残留成功导入产生的备份"]
+    },
+    {
+      "id": "macos-icloud-hidden-17",
+      "type": "regression",
+      "prompt": "在 macOS 的 iCloud Drive 目录中原地更新一个 Finder 可见的统计表。",
+      "input_files": ["iCloud Drive 中不带 UF_HIDDEN 的测试统计表", "清理版"],
+      "expected_behavior": ["主写入临时文件和回退临时文件不使用点号开头的文件名", "替换前后文件系统标志完全一致", "fileSystemFlagsPreserved 为 true", "更新后的原统计表不带 UF_HIDDEN"]
+    }
+  ]
+}

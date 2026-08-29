@@ -7,7 +7,7 @@
 | Skill | 用途 | 主要依赖 |
 |---|---|---|
 | `baoluo-pdf-scan-to-markdown` | 使用 macOS Vision OCR 将扫描版 PDF 转换为 Markdown | macOS 12+、Python 3、PyObjC |
-| `baoluo-qianji-bill-cleaner` | 按日期清理钱迹 CSV／XLSX 账单，并安全导入财务统计表副本 | Python 3（仅使用标准库） |
+| `baoluo-qianji-bill-cleaner` | 按日期清理钱迹 CSV／XLSX 账单，备份并校验后安全更新原财务统计表 | Python 3（仅使用标准库） |
 | `baoluo-video-to-audio` | 使用 FFmpeg 从视频中提取 M4A 音频 | Python 3、FFmpeg |
 
 ## 安装
