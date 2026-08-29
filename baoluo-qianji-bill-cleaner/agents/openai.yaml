@@ -1,4 +1,4 @@
 interface:
-  display_name: "钱迹账单清理"
-  short_description: "先确认日期范围，再清理钱迹收支账单并输出 Excel"
-  default_prompt: "Use $baoluo-qianji-bill-cleaner to clean this QianJi bill file and save the Excel output to my specified folder."
+  display_name: "baoluo-qianji-bill-cleaner"
+  short_description: "按日期清理钱迹账单，并安全导入财务收支统计表副本文件"
+  default_prompt: "Use $baoluo-qianji-bill-cleaner to inspect and clean this QianJi bill, then import it into a safe copy of my financial workbook when requested."
